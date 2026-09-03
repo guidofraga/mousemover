@@ -7,8 +7,12 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var flickTimer: Timer?
     private var stopTimer: Timer?
+    private var menuRefreshTimer: Timer?
     private var isRunning = false
     private var runUntil: Date?
+    private var lastFlick: Date?
+    private let idlePollInterval: TimeInterval = 5
+    private static let anyInputEventType = CGEventType(rawValue: UInt32.max)!
 
     private var toggleItem: NSMenuItem!
     private var statusItemInMenu: NSMenuItem!
@@ -31,9 +35,12 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static func main() {
         let app = NSApplication.shared
         let delegate = MouseMoverApp()
+        retainedDelegate = delegate
         app.delegate = delegate
         app.run()
     }
+
+    private static var retainedDelegate: MouseMoverApp?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -44,8 +51,12 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func buildMenuBarItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "cursorarrow.motionlines", accessibilityDescription: "Mouse Mover")
-            button.image?.isTemplate = true
+            if let image = NSImage(systemSymbolName: "cursorarrow.motionlines", accessibilityDescription: "Mouse Mover") {
+                button.image = image
+                button.image?.isTemplate = true
+            } else {
+                button.title = "MM"
+            }
             button.toolTip = "Mouse Mover"
         }
 
@@ -85,13 +96,35 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshMenu() {
         toggleItem.title = isRunning ? "Turn Off" : "Turn On"
-        statusItemInMenu.title = isRunning ? runningStatusText : "Off"
         rebuildIntervalMenu()
         rebuildDurationMenu()
+        updateStatusAppearance()
+        updateMenuRefreshTimer()
+    }
+
+    private func updateStatusAppearance() {
+        let status = isRunning ? runningStatusText : "Off"
+        statusItemInMenu.title = status
+        if let button = statusItem.button {
+            button.appearsDisabled = !isRunning
+            button.toolTip = isRunning ? "Mouse Mover – \(status)" : "Mouse Mover – Off"
+        }
+    }
+
+    private func updateMenuRefreshTimer() {
+        menuRefreshTimer?.invalidate()
+        menuRefreshTimer = nil
+        guard isRunning else { return }
+        let timer = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
+            self?.updateStatusAppearance()
+        }
+        timer.tolerance = 5
+        RunLoop.main.add(timer, forMode: .common)
+        menuRefreshTimer = timer
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        statusItemInMenu.title = isRunning ? runningStatusText : "Off"
+        updateStatusAppearance()
     }
 
     private func rebuildIntervalMenu() {
@@ -143,13 +176,16 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func start() {
-        let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-        guard AXIsProcessTrustedWithOptions(options) else {
-            openAccessibilitySettings()
-            return
+        if !AXIsProcessTrusted() {
+            let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+            guard AXIsProcessTrustedWithOptions(options) else {
+                openAccessibilitySettings()
+                return
+            }
         }
 
         isRunning = true
+        lastFlick = nil
         restartFlickTimer()
         scheduleStop()
         refreshMenu()
@@ -157,10 +193,12 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func restartFlickTimer() {
         flickTimer?.invalidate()
-        flickTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.flickMouse()
+        let timer = Timer(timeInterval: idlePollInterval, repeats: true) { [weak self] _ in
+            self?.maybeFlick()
         }
-        flickTimer?.tolerance = min(10, interval * 0.05)
+        timer.tolerance = 2
+        RunLoop.main.add(timer, forMode: .common)
+        flickTimer = timer
     }
 
     private func scheduleStop() {
@@ -168,9 +206,11 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopTimer = nil
         if let duration {
             runUntil = Date().addingTimeInterval(duration)
-            stopTimer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
+            let timer = Timer(timeInterval: duration, repeats: false) { [weak self] _ in
                 self?.stop()
             }
+            RunLoop.main.add(timer, forMode: .common)
+            stopTimer = timer
         } else {
             runUntil = nil
         }
@@ -180,20 +220,44 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isRunning = false
         flickTimer?.invalidate()
         stopTimer?.invalidate()
+        menuRefreshTimer?.invalidate()
         flickTimer = nil
         stopTimer = nil
+        menuRefreshTimer = nil
         runUntil = nil
+        lastFlick = nil
         refreshMenu()
     }
 
+    private func maybeFlick() {
+        guard isRunning else { return }
+        if let lastFlick, Date().timeIntervalSince(lastFlick) < interval { return }
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: Self.anyInputEventType)
+        guard idle >= interval else { return }
+        flickMouse()
+    }
+
+    private func isAnyMouseButtonPressed() -> Bool {
+        CGEventSource.buttonState(.hidSystemState, button: .left)
+            || CGEventSource.buttonState(.hidSystemState, button: .right)
+            || CGEventSource.buttonState(.hidSystemState, button: .center)
+    }
+
     private func flickMouse() {
-        guard isRunning, !CGEventSource.buttonState(.hidSystemState, button: .left),
-              !CGEventSource.buttonState(.hidSystemState, button: .right) else { return }
+        guard isRunning, !isAnyMouseButtonPressed() else { return }
         guard let current = CGEvent(source: nil)?.location else { return }
-        let target = CGPoint(x: current.x + 2, y: current.y)
+        lastFlick = Date()
+        // Bounce away from the right screen edge so the +2px move never clamps off-screen.
+        let delta: CGFloat
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(current) }) ?? NSScreen.main {
+            delta = (current.x + 2 <= NSMaxX(screen.frame) - 1) ? 2 : -2
+        } else {
+            delta = 2
+        }
+        let target = CGPoint(x: current.x + delta, y: current.y)
         CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: target, mouseButton: .left)?.post(tap: .cghidEventTap)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            guard self.isRunning else { return }
+            guard self.isRunning, !self.isAnyMouseButtonPressed() else { return }
             CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: current, mouseButton: .left)?.post(tap: .cghidEventTap)
         }
     }
@@ -212,9 +276,10 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func selectCustomDuration() {
+        NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Turn off after"
-        alert.informativeText = "Enter the number of minutes Mouse Mover should stay on."
+        alert.informativeText = "Enter the number of minutes Mouse Mover should stay on (1–1440)."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
         if let duration {
             field.stringValue = String(Int(duration / 60))
@@ -225,15 +290,27 @@ final class MouseMoverApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.accessoryView = field
         alert.addButton(withTitle: "Set")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn,
-              let minutes = Double(field.stringValue), minutes > 0 else { return }
+        alert.window.initialFirstResponder = field
+        field.selectText(nil)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let cleaned = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+        guard let minutes = Double(cleaned), minutes >= 1, minutes <= 1440 else {
+            NSSound.beep()
+            return
+        }
         duration = minutes * 60
         if isRunning { scheduleStop() }
         refreshMenu()
     }
 
     @objc private func openAccessibilitySettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        let urls = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.preference.security",
+        ]
+        for string in urls {
+            if let url = URL(string: string), NSWorkspace.shared.open(url) { return }
+        }
     }
 
     @objc private func quit() {
