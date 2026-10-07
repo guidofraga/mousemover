@@ -2,6 +2,16 @@
 
 A lightweight native macOS menu-bar utility that periodically flicks the mouse cursor by two pixels and returns it to its original position.
 
+## Download
+
+Grab the latest `MouseMover-1.0.0.dmg` (or `.zip`) from [Releases](https://github.com/guidofraga/mousemover/releases/latest), open it, and drag **Mouse Mover** into **Applications**. The app is ad-hoc signed rather than notarized, so the first launch needs approval: right-click the app and choose **Open**, or use **System Settings > Privacy & Security > Open Anyway**. If macOS reports the app as damaged, run:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/MouseMover.app
+```
+
+Then allow Mouse Mover in **System Settings > Privacy & Security > Accessibility** when prompted.
+
 ## Run
 
 ```sh
@@ -15,6 +25,12 @@ make install
 ```
 
 This builds `MouseMover.app` into `/Applications` and opens it. After that, launch **Mouse Mover** directly from Spotlight or Raycast; Terminal does not need to remain open.
+
+To build distributable artifacts (`dist/MouseMover-1.0.0.dmg` and `.zip`):
+
+```sh
+make dist
+```
 
 It remembers whether it was on when you last quit and restores that state at launch (it starts on the very first run), so the first time you run it, allow Mouse Mover in **System Settings > Privacy & Security > Accessibility**. Use the menu-bar cursor icon to turn it on or off, flick once right away with **Flick Now**, choose the flick interval (presets or a custom value in seconds), and choose when it should automatically turn off. While it is off, picking a **Turn Off After** option also turns it on with that setting.
 
